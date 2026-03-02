@@ -1,0 +1,99 @@
+#!/bin/bash
+
+############################################################################################
+# Submit this script as a job using:
+# qsub hpc_model_tuning.job -v "BASE_DIR=/mnt/lustre/users/cvansteenderen/ACP/tuning",PREDICTORS_PATH="predictors.tif",OCC_PATH="presence.rds,BG_PATH=background.rds"
+
+# example
+# qsub hpc_model_tuning.job -v BASE_DIR="/mnt/lustre/users/cvansteenderen/reyard/p.longispinus",PREDICTORS_PATH="/mnt/lustre/users/cvansteenderen/reyard/p.longispinus/p.longispinus.tif",OCC_PATH="/mnt/lustre/users/cvansteenderen/reyard/p.longispinus/PRES_p.longispinus.rds",BG_PATH="/mnt/lustre/users/cvansteenderen/reyard/p.longispinus/BACK_p.longispinus.rds"
+
+# The presence and background points should have only two columns: longitude and latitude, in that exact order
+# column names don't matter
+############################################################################################
+
+#PBS -l select=2:ncpus=24
+#PBS -P CBBI1682
+#PBS -q normal
+#PBS -l walltime=2:30:00
+#PBS -o /mnt/lustre/users/cvansteenderen/reyard/enmeval_stdout.txt
+#PBS -e /mnt/lustre/users/cvansteenderen/reyard/enmeval_stderr.txt
+#PBS -N maxent_model_tuning
+#PBS -M vsteenderen@gmail.com
+#PBS -m abe
+
+##############################################################
+
+module load chpc/BIOMODULES R/4.2.0
+export LANG=en_US.UTF-8 
+export LC_ALL=en_US.UTF-8
+
+cd "$BASE_DIR"
+
+export PREDICTORS_PATH="$PREDICTORS_PATH"
+export OCC_PATH="$OCC_PATH"
+export BG_PATH="$BG_PATH"
+
+R --vanilla <<R_SCRIPT
+
+library(terra)
+library(ENMeval)
+library(dplyr)
+library(tidyr)
+library(magrittr)
+
+# Read the file paths from environment variables
+
+predictors_path = Sys.getenv("PREDICTORS_PATH")
+occ_path = Sys.getenv("OCC_PATH")
+bg_path = Sys.getenv("BG_PATH")
+
+# Load the files using the correct paths
+
+predictors = terra::rast(predictors_path)
+preds = raster::stack(predictors) %>%
+terra::rast()
+
+occ.data = readRDS(occ_path)
+bg.data = readRDS(bg_path)
+
+list_settings = list(
+  fc = c("L","Q","H","LQH"), 
+  rm = c(1:5)
+)
+
+options(java.parameters = "-Xmx16000m")
+
+tuning_results = 
+  ENMeval::ENMevaluate(
+    occs = occ.data,
+    envs = preds,
+    bg = bg.data,
+    tune.args = list_settings, 
+    partitions = "block",
+    algorithm = "maxent.jar",
+    doClamp = FALSE,
+	parallel = TRUE
+  )
+
+# Extract the model tuning results to a data.frame 
+res = ENMeval::eval.results(tuning_results)
+res = na.omit(res)
+
+subset_res = res %>%
+  dplyr::select(rm, fc, auc.val.avg, auc.diff.avg, cbi.val.avg, or.10p.avg, AICc)
+
+df_long = subset_res %>%
+  tidyr::gather(key = "variable", value = "value", -rm, -fc)
+
+df_long$rm = as.factor(df_long$rm)
+
+write.csv(df_long, file = "model_tuning_enmeval.csv", 
+          quote = FALSE, row.names = FALSE)
+
+write.csv(res, file = "model_tuning_enmeval_full.csv", 
+          quote = FALSE, row.names = FALSE)
+
+write.csv(subset_res, file = "model_tuning_enmeval_reduced.csv", 
+          quote = FALSE, row.names = FALSE)
+
+R_SCRIPT

@@ -1,0 +1,483 @@
+#!/bin/bash
+
+############################################################################################
+
+# convert this file to Unix format first to be safe:
+# dos2unix hpc_ensemble_models.job
+
+# Submit this script as a job using:
+# example
+# qsub -v BASE_DIR="/mnt/lustre/users/cvansteenderen/reyard",SPECIES="d.aberiae",PRES_PATH="data/PRESPOINTS.ALLSPP.rds",BACK_PATH="data/BACKPOINTS.ALLSPP.rds",FC="lqh",RM="1" hpc_ensemble_models.job
+# qsub -v BASE_DIR="/mnt/lustre/users/cvansteenderen/reyard",SPECIES="n.viridis",PRES_PATH="data/PRESPOINTS.ALLSPP.rds",BACK_PATH="data/BACKPOINTS.ALLSPP.rds",FC="h",RM="3" hpc_ensemble_models.job
+# qsub -v BASE_DIR="/mnt/lustre/users/cvansteenderen/reyard",SPECIES="p.citri",PRES_PATH="data/PRESPOINTS.ALLSPP.rds",BACK_PATH="data/BACKPOINTS.ALLSPP.rds",FC="lqh",RM="2" hpc_ensemble_models.job
+# qsub -v BASE_DIR="/mnt/lustre/users/cvansteenderen/reyard",SPECIES="p.calceolariae",PRES_PATH="data/PRESPOINTS.ALLSPP.rds",BACK_PATH="data/BACKPOINTS.ALLSPP.rds",FC="lqh",RM="5",ROC_THRESH="0.8" hpc_ensemble_models.job
+# qsub -v BASE_DIR="/mnt/lustre/users/cvansteenderen/reyard",SPECIES="p.longispinus",PRES_PATH="data/PRESPOINTS.ALLSPP.rds",BACK_PATH="data/BACKPOINTS.ALLSPP.rds",FC="lqh",RM="2" hpc_ensemble_models.job
+
+# Base directory for your project
+#BASE_DIR <- "/mnt/lustre/users/cvansteenderen/reyard"
+# Species you want to model
+#SPECIES <- "d.aberiae"
+# Paths to presence / background points
+#PRES_PATH <- file.path(BASE_DIR, "data", "PRESPOINTS.ALLSPP.rds")
+#BACK_PATH <- file.path(BASE_DIR, "data", "BACKPOINTS.ALLSPP.rds")
+# Modeling options
+#FC <- "lqh"
+#RM <- "1"
+
+############################################################################################
+
+#PBS -l select=2:ncpus=24
+#PBS -P CBBI1682
+#PBS -q normal
+#PBS -l walltime=4:30:00
+#PBS -o /mnt/lustre/users/cvansteenderen/reyard/ensemble_models_stdout.txt
+#PBS -e /mnt/lustre/users/cvansteenderen/reyard/ensemble_models_stderr.txt
+#PBS -N SDM_ensemble
+#PBS -M vsteenderen@gmail.com
+#PBS -m abe
+
+##############################################################
+
+module load chpc/BIOMODULES R/4.2.0
+export LANG=en_US.UTF-8 
+export LC_ALL=en_US.UTF-8
+
+cd "$BASE_DIR"
+
+# ---- USER INPUTS ----
+
+# Provide the species name (must match the name in the pres and backpoints list)
+# path to the pres and back points lists. These are simple DFs with lat, lon, and bio vars for a particular species
+# FC and RM values from MaxEnt tuning
+# there must be a data/ folder in the main directory that also contains the raster files for each species and time period. E.g.:
+# n.viridis_2050.tif, n.viridis_current.tif (naming is NB: genus.species_year.tif)
+# these are raster files with all the worldclim data for each desired predictor variable for that species
+# the first part of the file name must match the species name provided here
+# the script assumes the years: current, 2050, 2070, 2100 (change this in the script itself if desired, as it is hardcoded here)
+# this script assumes a 80/20 training testing split, and 15 replicates for the model fitting (also hardcoded)
+
+export SPECIES="$SPECIES"
+export PRES_PATH="$PRES_PATH"
+export BACK_PATH="$BACK_PATH"
+export FC="$FC"
+export RM="$RM"
+export ROC_THRESH="$ROC_THRESH"
+
+R --vanilla <<R_SCRIPT
+
+library(biomod2)
+library(magrittr)
+library(tidyverse)
+library(terra)
+library(janitor)
+library(ggthemes)
+library(rnaturalearth)
+library(RColorBrewer)
+library(earth)
+library(mda)
+
+# -----------------------------
+# Read environment variables
+# -----------------------------
+
+species      <- Sys.getenv("SPECIES")
+pres_path    <- Sys.getenv("PRES_PATH")
+back_path    <- Sys.getenv("BACK_PATH")
+fc_setting   <- Sys.getenv("FC")
+rm_setting   <- as.numeric(Sys.getenv("RM"))
+
+# Read ROC threshold from environment, default to 0.85
+roc_thresh <- Sys.getenv("ROC_THRESH")
+if (roc_thresh == "") {
+  roc_thresh <- 0.85
+} else {
+  roc_thresh <- as.numeric(roc_thresh)
+}
+
+# Check
+message("ROC threshold = ", roc_thresh)
+
+cat("Running SDM for:", species, "\n")
+cat("Feature class:", fc_setting, "\n")
+cat("Regularization multiplier:", rm_setting, "\n")
+
+# -----------------------------
+# Load data
+# -----------------------------
+
+PRESPOINTS <- readRDS(pres_path)
+BACKPOINTS <- readRDS(back_path)
+
+# Dynamically extract species
+coords.pres <- PRESPOINTS[[species]] %>%
+  dplyr::select(longitude, latitude)
+
+coords.back <- BACKPOINTS[[species]] %>%
+  dplyr::select(longitude, latitude)
+
+coords <- rbind(coords.pres, coords.back)
+
+resp_vector <- c(
+  rep(1, nrow(coords.pres)),
+  rep(0, nrow(coords.back))
+)
+
+# Environmental predictors
+pred_path <- paste0("data/", species, "_current.tif")
+preds <- terra::rast(pred_path)
+
+# Extract environmental data
+PRES_env <- PRESPOINTS[[species]] %>%
+  dplyr::select(-c(species, latitude, longitude, source)) %>%
+  janitor::clean_names()
+
+BACK_env <- BACKPOINTS[[species]] %>%
+  dplyr::select(-c(latitude, longitude)) %>%
+  janitor::clean_names()
+
+env_data <- dplyr::bind_rows(PRES_env, BACK_env)
+rownames(env_data) <- NULL
+
+# -----------------------------
+# Format BIOMOD data
+# -----------------------------
+
+myBiomodData <- BIOMOD_FormatingData(
+  resp.var = as.numeric(resp_vector),
+  expl.var = preds,
+  resp.xy  = as.data.frame(coords),
+  resp.name = species,
+  PA.nb.rep = 0,
+  filter.raster = TRUE
+)
+
+myBiomodData
+
+# -----------------------------
+# Default modeling options
+# -----------------------------
+
+avail_opts <- names(bm_ModelingOptions(
+  data.type = "binary",
+  models = "MAXNET",
+  strategy = "default",
+  bm.format = myBiomodData
+)@options)
+
+maxnet_key <- grep("MAXNET", avail_opts, value = TRUE)
+
+print(maxnet_key) # check
+
+maxnet_user_options <- list(
+  classes = fc_setting,    
+  regmult = rm_setting 
+)
+
+myBiomodOptions <- bm_ModelingOptions(
+  data.type = "binary",
+  models = c('MAXNET','RF','RFd','GLM',"GBM","ANN","MARS","FDA","CTA"),
+  strategy = "user.defined",
+  user.val = setNames(
+    list(list('_allData_allRun' = maxnet_user_options)),
+    maxnet_key
+  ),
+  bm.format = myBiomodData
+)
+
+print(myBiomodOptions)
+
+# -----------------------------
+# Run model
+# -----------------------------
+
+model_out <- BIOMOD_Modeling(
+  bm.format = myBiomodData,
+  modeling.id = species,
+  models = c('MAXNET', 'RF', 'RFd', 'GLM', 'GBM', 'ANN', 'MARS', 'FDA', 'CTA'),
+  bm.options = myBiomodOptions,
+  CV.strategy = "random",
+  CV.perc = 0.8, #data split train:test
+  CV.nb.rep = 15,
+  metric.eval = c('TSS', 'ROC', 'KAPPA'),
+  var.import = 3
+)
+
+# Ensure figures directory exists
+if (!dir.exists("figures")) {
+  dir.create("figures", recursive = TRUE)
+}
+
+# -----------------------------
+# 1. Get raw evaluations
+# -----------------------------
+
+myEval <- get_evaluations(model_out)
+
+# -----------------------------
+# 2. Summary table
+# -----------------------------
+
+eval_summary <- myEval %>%
+  dplyr::group_by(algo, metric.eval) %>%
+  dplyr::summarise(
+    Mean = mean(validation, na.rm = TRUE),
+    SD = sd(validation, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  dplyr::mutate(across(c(Mean, SD), ~ round(.x, 3))) %>%
+  dplyr::mutate(Display = paste0(Mean, " (+/- ", SD, ")"))
+
+eval_final <- eval_summary %>%
+  dplyr::select(algo, metric.eval, Display) %>%
+  tidyr::pivot_wider(names_from = metric.eval, values_from = Display)
+
+# Arrange by ROC only if it exists
+if ("ROC" %in% names(eval_final)) {
+  eval_final <- eval_final %>% arrange(desc(ROC))
+}
+
+write.csv(
+  eval_final,
+  file = paste0("figures/", species, "_model_metrics.csv"),
+  row.names = FALSE,
+  quote = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+# -----------------------------
+# Performance Boxplot
+# -----------------------------
+
+# Extract the evaluation data
+perf_data <- get_evaluations(model_out)
+
+biomod_performance_box <- ggplot(perf_data, aes(x = algo, y = calibration, fill = algo)) +
+  geom_boxplot() +
+  facet_wrap(~ metric.eval, scales = "free_y") +
+  labs(
+    x = "Model",
+    y = "Calibration",
+    subtitle = bquote(italic(.(species)))   # italic species name
+  ) +
+  scale_fill_tableau() +
+  theme_classic() +
+  theme(
+    strip.text = element_text(face = "bold"),  # facet labels bold
+    axis.text.x = element_text(angle = 45, hjust = 1)  # rotate x labels
+  )
+
+ggsave(
+  paste0("figures/", species, "_biomod_performance_box.png"),
+  plot = biomod_performance_box,
+  width = 8, height = 5, dpi = 350
+)
+
+ggsave(
+  paste0("figures/", species, "_biomod_performance_box.svg"),
+  plot = biomod_performance_box,
+  width = 8, height = 5, dpi = 350
+)
+
+# -----------------------------
+# Variable Importance
+# -----------------------------
+
+myVarImp <- get_variables_importance(model_out)
+
+# Combine importance across algorithms
+varimp_df <- myVarImp %>%
+  dplyr::select(algo, expl.var, var.imp)
+
+# Make boxplot
+varimp_box <- ggplot(varimp_df, aes(x = expl.var, y = var.imp, fill = algo)) +
+  geom_boxplot() +
+  facet_wrap(~algo) +
+  labs(
+    x = "Predictor",
+    y = "Variable Importance",
+    subtitle = bquote(italic(.(species)))
+  ) +
+  scale_fill_tableau() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+write.csv(varimp_df, paste0("figures/", species, "_var_importance.csv"), row.names = F)
+
+# save
+
+ggsave(
+  paste0("figures/", species, "_var_contrib.png"),
+  plot = varimp_box,
+  width = 10, height = 8, dpi = 350
+)
+
+ggsave(
+  paste0("figures/", species, "_var_contrib.svg"),
+  plot = varimp_box,
+  width = 15, height = 8, dpi = 350
+)
+
+# -----------------------------
+# Response Curves
+# -----------------------------
+
+predictions <- get_predictions(model_out)
+
+env_data <- PRES_env %>%
+  dplyr::mutate(points = row_number())
+
+resp_data <- predictions %>%
+  dplyr::left_join(env_data, by = "points")
+  
+resp_data_long <- resp_data %>%
+  tidyr::pivot_longer(
+    cols = starts_with("bio_"),   # select your environmental variables
+    names_to = "expl.var",
+    values_to = "expl.val"
+  )
+  
+resp.plot <- ggplot(resp_data_long, aes(x = expl.val, y = pred, color = algo, fill = algo)) +
+  geom_smooth(method = "loess", span = 0.5, se = FALSE) +
+  scale_color_tableau() +
+  scale_fill_tableau() +
+  facet_wrap(~ expl.var, scales = "free_x") +
+  theme_classic() +
+  labs(
+    title = "Model Response Curves",
+    subtitle = bquote(italic(.(species))),
+    y = "Predicted Probability",
+    x = "Environmental Variable",
+    color = "Model",
+    fill = "Model"
+  ) +
+  theme(legend.position = "right")
+
+ggsave(
+  paste0("figures/", species, "_resp_plot.png"),
+  plot = resp.plot,
+  width = 15, height = 7, dpi = 350
+)
+
+ggsave(
+  paste0("figures/", species, "_resp_plot.svg"),
+  plot = resp.plot,
+  width = 15, height = 7, dpi = 350
+)
+
+# -----------------------------
+# Ensemble Modeling
+# -----------------------------
+
+myBiomodEM <- BIOMOD_EnsembleModeling(
+  bm.mod = model_out,
+  models.chosen = 'all',
+  em.by = 'all',
+  em.algo = c('EMwmean'),
+  metric.select = 'ROC',
+  metric.select.thresh = 0.8, # set strictness here
+  var.import = 3,
+  prob.mean = TRUE,
+  prob.ci = TRUE
+)
+
+myKeptModels <- get_kept_models(myBiomodEM)
+
+####################################################################################
+# PROJECT THIS ENSEMBLE MODEL ONTO AFRICA
+####################################################################################
+
+# Ensure projections directory exists safely
+if (!dir.exists("projections")) {
+  dir.create("projections", recursive = TRUE)
+}
+
+# Africa shapefile
+africa_ext <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf") %>%
+  dplyr::filter(continent == "Africa")
+
+africa_vect <- terra::vect(africa_ext)
+
+years <- c("current", "2050", "2070", "2100")
+
+mycols  <- rev(colorRampPalette(brewer.pal(9, "RdYlBu"))(100))
+diffcols <- rev(colorRampPalette(brewer.pal(9, "PuOr"))(100))
+
+predict_list <- list()
+
+for (yr in years) {
+  
+  cat("Processing year:", yr, "\n")
+  
+  # -----------------------------
+  # 1. Read raster dynamically
+  # -----------------------------
+  
+  raster_file <- paste0("data/", species, "_", yr, ".tif")
+  r <- terra::rast(raster_file)
+  
+  # -----------------------------
+  # 2. Crop to Africa
+  # -----------------------------
+  
+  r <- terra::crop(r, terra::ext(africa_vect))
+  r <- terra::mask(r, africa_vect)
+  
+  crs(r) <- "EPSG:4326"
+  
+  # Match predictor names from training object
+  names(r) <- names(preds)
+  
+  # -------------------------------------------------------------
+  # BIOMOD2 Projection
+  # -------------------------------------------------------------
+  
+  myProj <- BIOMOD_Projection(
+    bm.mod = model_out,
+    proj.name = paste0("Proj_", yr),
+    new.env = r,
+    models.chosen = 'all',
+    build.clamping.mask = FALSE
+  )
+  
+  myEnsProj <- BIOMOD_EnsembleForecasting(
+    bm.em = myBiomodEM,
+    bm.proj = myProj,
+    models.chosen = 'all'
+  )
+  
+  # -----------------------------
+  # Extract final raster
+  # -----------------------------
+  
+  final_raster <- get_predictions(myEnsProj)
+  
+  # Save in list
+  predict_list[[yr]] <- final_raster
+  
+  # -----------------------------
+  # Optional: Save raster safely
+  # -----------------------------
+  
+  out_file <- paste0("projections/", species, "_ensemble_", yr, ".tif")
+  
+  terra::writeRaster(
+    final_raster,
+    filename = out_file,
+    overwrite = TRUE   # change to FALSE if you want strict protection
+  )
+  
+  # Optional plot (commented)
+  # plot(final_raster,
+  #      main = paste("Ensemble Suitability:", species, yr),
+  #      col = mycols)
+}
+
+
+# Once you have the raster files written out from this, you can do some
+# downstream mapping locally
+
+R_SCRIPT
